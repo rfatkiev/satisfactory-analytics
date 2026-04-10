@@ -1,3 +1,5 @@
+# WORK IN PROGRESS
+
 # Satisfactory Save Parser
 
 Python tools for parsing Satisfactory save files and exporting factory analytics.

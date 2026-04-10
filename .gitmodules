@@ -1,0 +1,6 @@
+[submodule ".vendor/sat_sav_parse"]
+	path = .vendor/sat_sav_parse
+	url = https://github.com/GreyHak/sat_sav_parse.git
+[submodule ".vendor/SatisfactoryTools"]
+	path = .vendor/SatisfactoryTools
+	url = https://github.com/greeny/SatisfactoryTools.git

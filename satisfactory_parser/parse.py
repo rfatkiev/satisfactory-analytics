@@ -6,6 +6,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -23,6 +24,8 @@ from .game_data import (
 
 SCHEMA_VERSION = "2.0"
 VENDOR_DIR = Path(__file__).resolve().parent.parent / ".vendor" / "sat_sav_parse"
+DOTNET_EPOCH = datetime(1, 1, 1, tzinfo=timezone.utc)
+TIME_SERIES_COLUMNS = ["save_datetime", "save_day", "play_time_hours", "save_date_raw"]
 RESOURCE_LABELS = {
     "Desc_OreIron_C": "Железо",
     "Desc_OreCopper_C": "Медь",
@@ -185,6 +188,8 @@ def _flatten_save(parsed_save: Any) -> Dict[str, Any]:
 
 def _build_metadata(path: Path, parsed_save: Any, flattened: Dict[str, Any]) -> Dict[str, Any]:
     info = parsed_save.saveFileInfo
+    save_ticks = getattr(info, "saveDateTimeInTicks", None)
+    save_datetime = _save_ticks_to_datetime(save_ticks)
     return {
         "schema_version": SCHEMA_VERSION,
         "parser_version": __version__,
@@ -194,7 +199,9 @@ def _build_metadata(path: Path, parsed_save: Any, flattened: Dict[str, Any]) -> 
         "map_name": getattr(info, "mapName", ""),
         "map_options": getattr(info, "mapOptions", ""),
         "play_duration_seconds": getattr(info, "playDurationInSeconds", None),
-        "save_date": getattr(info, "saveDateTimeInTicks", None),
+        "save_date": save_ticks,
+        "save_datetime": _format_datetime(save_datetime),
+        "save_day": save_datetime.date().isoformat() if save_datetime else "",
         "save_header_type": getattr(info, "saveHeaderType", None),
         "save_version": getattr(info, "saveVersion", None),
         "build_version": getattr(info, "buildVersion", None),
@@ -1027,7 +1034,339 @@ def _time_columns(metadata: Dict[str, Any]) -> Tuple[List[str], List[str]]:
     else:
         play_hours_str = ""
 
+    save_datetime = metadata.get("save_datetime", "") or ""
+    save_day = metadata.get("save_day", "") or ""
     save_date_raw = metadata.get("save_date")
     save_date_str = str(save_date_raw) if save_date_raw is not None else ""
 
-    return ["play_time_hours", "save_date_raw"], [play_hours_str, save_date_str]
+    return TIME_SERIES_COLUMNS, [
+        save_datetime,
+        save_day,
+        play_hours_str,
+        save_date_str,
+    ]
+
+
+def parse_saves_in_directory(input_dir: Path) -> List[ParseResult]:
+    save_paths = sorted(input_dir.glob("*.sav"), key=lambda item: item.name.casefold())
+    return [parse_save(path) for path in save_paths]
+
+
+def write_timeline_csv(results: Iterable[ParseResult], output_path: Path) -> Path:
+    rows = [_timeline_row(result) for result in results]
+    if not rows:
+        raise ValueError("No parsed saves were provided for timeline export")
+
+    fixed_headers = [
+        *TIME_SERIES_COLUMNS,
+        "save_name",
+        "session_name",
+        "map_name",
+        "source_file",
+        "source_path",
+        "save_version",
+        "build_version",
+        "save_header_type",
+        "is_modded",
+        "levels_count",
+        "partitions_count",
+        "objects_count",
+        "entities_count",
+        "actor_count",
+        "component_count",
+    ]
+    dynamic_headers = sorted(
+        {
+            key
+            for row in rows
+            for key in row
+            if key not in fixed_headers
+        }
+    )
+    headers = fixed_headers + dynamic_headers
+
+    def sort_key(row: Dict[str, Any]) -> Tuple[str, str]:
+        return (
+            str(row.get("save_datetime", "")),
+            str(row.get("source_file", "")),
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=headers, extrasaction="ignore")
+        writer.writeheader()
+        for row in sorted(rows, key=sort_key):
+            writer.writerow({header: row.get(header, "") for header in headers})
+
+    return output_path
+
+
+def write_timeline_csv_bundle(results: Iterable[ParseResult], output_dir: Path) -> List[Path]:
+    rows = [_timeline_row(result) for result in results]
+    if not rows:
+        raise ValueError("No parsed saves were provided for timeline export")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    files: List[Path] = []
+    files.append(
+        _write_timeline_table(
+            output_dir / "saves_metadata.csv",
+            rows,
+            [
+                "save_name",
+                "session_name",
+                "map_name",
+                "source_file",
+                "source_path",
+                "save_version",
+                "build_version",
+                "save_header_type",
+                "is_modded",
+                "levels_count",
+                "partitions_count",
+                "objects_count",
+                "entities_count",
+                "actor_count",
+                "component_count",
+            ],
+        )
+    )
+    files.append(
+        _write_timeline_table(
+            output_dir / "saves_power_metrics.csv",
+            rows,
+            _matching_columns(rows, "metric__power_"),
+        )
+    )
+    files.append(
+        _write_timeline_table(
+            output_dir / "saves_biomass_metrics.csv",
+            rows,
+            _matching_columns(rows, "metric__biomass_"),
+        )
+    )
+    files.append(
+        _write_timeline_table(
+            output_dir / "saves_mining_metrics.csv",
+            rows,
+            _matching_columns(rows, "metric__mining_"),
+        )
+    )
+    files.append(
+        _write_timeline_table(
+            output_dir / "saves_progression_metrics.csv",
+            rows,
+            _matching_columns(
+                rows,
+                "metric__purchased_",
+                "metric__map_unlocked",
+                "metric__building_efficiency_unlocked",
+                "metric__building_overclock_unlocked",
+                "metric__blueprints_unlocked",
+            ),
+        )
+    )
+    files.append(
+        _write_timeline_table(
+            output_dir / "saves_machine_counts.csv",
+            rows,
+            _matching_columns(rows, "machine_count__"),
+        )
+    )
+    files.append(
+        _write_timeline_table(
+            output_dir / "saves_recipe_usage_counts.csv",
+            rows,
+            _matching_columns(rows, "production_recipe_machine_count__"),
+        )
+    )
+    files.append(
+        _write_timeline_table(
+            output_dir / "saves_property_summary_counts.csv",
+            rows,
+            _matching_columns(rows, "property__"),
+        )
+    )
+    files.append(
+        _write_timeline_table(
+            output_dir / "saves_production_category_counts.csv",
+            rows,
+            _matching_columns(rows, "production_count__", "production_active_count__"),
+        )
+    )
+    files.append(
+        _write_timeline_table(
+            output_dir / "saves_production_outputs.csv",
+            rows,
+            _matching_columns(rows, "production_output_per_min__"),
+        )
+    )
+    files.append(
+        _write_timeline_table(
+            output_dir / "saves_resource_rates.csv",
+            rows,
+            _matching_columns(rows, "resource_rate_per_min__", "resource_machine_count__"),
+        )
+    )
+
+    return files
+
+
+def _timeline_row(result: ParseResult) -> Dict[str, Any]:
+    metadata = result.metadata
+    row: Dict[str, Any] = {
+        "save_datetime": metadata.get("save_datetime", ""),
+        "save_day": metadata.get("save_day", ""),
+        "play_time_hours": _play_time_hours(metadata),
+        "save_date_raw": metadata.get("save_date", ""),
+        "save_name": metadata.get("save_name", ""),
+        "session_name": metadata.get("session_name", ""),
+        "map_name": metadata.get("map_name", ""),
+        "source_file": Path(str(metadata.get("source_path", ""))).name,
+        "source_path": metadata.get("source_path", ""),
+        "save_version": metadata.get("save_version", ""),
+        "build_version": metadata.get("build_version", ""),
+        "save_header_type": metadata.get("save_header_type", ""),
+        "is_modded": _normalize_scalar(metadata.get("is_modded")),
+        "levels_count": metadata.get("levels_count", ""),
+        "partitions_count": metadata.get("partitions_count", ""),
+        "objects_count": metadata.get("objects_count", ""),
+        "entities_count": metadata.get("entities_count", ""),
+        "actor_count": metadata.get("actor_count", ""),
+        "component_count": metadata.get("component_count", ""),
+    }
+
+    for key, value in sorted((metadata.get("static_catalog") or {}).items()):
+        row[f"static_catalog__{_safe_key(key)}"] = _normalize_scalar(value)
+
+    for key, value in sorted(result.metrics.items()):
+        _flatten_timeline_value(row, f"metric__{_safe_key(key)}", value)
+
+    for item in result.machine_counts:
+        machine_type = item.get("machine_type", "")
+        row[f"machine_count__{_safe_key(machine_type)}"] = _normalize_scalar(item.get("count", 0))
+
+    for item in result.properties_summary:
+        property_name = item.get("property_name", "")
+        property_type = item.get("property_type", "")
+        base = f"property__{_safe_key(property_name)}__{_safe_key(property_type)}"
+        row[f"{base}__count"] = _normalize_scalar(item.get("count", 0))
+        row[f"{base}__true_count"] = _normalize_scalar(item.get("true_count", 0))
+
+    category_counts = Counter(item.get("category", "") for item in result.production if item.get("category"))
+    active_category_counts = Counter(
+        item.get("category", "")
+        for item in result.production
+        if item.get("category") and item.get("is_producing") is True
+    )
+    for key, value in sorted(category_counts.items()):
+        row[f"production_count__{_safe_key(key)}"] = _normalize_scalar(value)
+    for key, value in sorted(active_category_counts.items()):
+        row[f"production_active_count__{_safe_key(key)}"] = _normalize_scalar(value)
+
+    recipe_rows = Counter(
+        item.get("current_recipe", "")
+        for item in result.production
+        if item.get("current_recipe")
+    )
+    for key, value in sorted(recipe_rows.items()):
+        row[f"production_recipe_machine_count__{_safe_key(key)}"] = _normalize_scalar(value)
+
+    recipe_output_rates = _summarize_output_rates(result.production)
+    for key, value in sorted(recipe_output_rates.items()):
+        row[f"production_output_per_min__{_safe_key(key)}"] = _normalize_scalar(value)
+
+    resource_rates = Counter()
+    resource_machine_counts = Counter()
+    for item in result.production:
+        resource_type = item.get("resource_type")
+        if not resource_type:
+            continue
+        resource_rates[resource_type] += float(item.get("resource_rate_per_min") or 0.0)
+        resource_machine_counts[resource_type] += 1
+    for key, value in sorted(resource_rates.items()):
+        row[f"resource_rate_per_min__{_safe_key(key)}"] = _normalize_scalar(round(value, 3))
+    for key, value in sorted(resource_machine_counts.items()):
+        row[f"resource_machine_count__{_safe_key(key)}"] = _normalize_scalar(value)
+
+    return row
+
+
+def _flatten_timeline_value(row: Dict[str, Any], prefix: str, value: Any) -> None:
+    if isinstance(value, dict):
+        for child_key, child_value in sorted(value.items()):
+            _flatten_timeline_value(row, f"{prefix}__{_safe_key(child_key)}", child_value)
+        return
+    row[prefix] = _normalize_scalar(value)
+
+
+def _matching_columns(rows: Iterable[Dict[str, Any]], *prefixes: str) -> List[str]:
+    return sorted(
+        {
+            key
+            for row in rows
+            for key in row
+            if any(key.startswith(prefix) for prefix in prefixes)
+        }
+    )
+
+
+def _write_timeline_table(path: Path, rows: List[Dict[str, Any]], columns: List[str]) -> Path:
+    headers = TIME_SERIES_COLUMNS + columns
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=headers, extrasaction="ignore")
+        writer.writeheader()
+        for row in sorted(rows, key=_timeline_sort_key):
+            writer.writerow({header: row.get(header, "") for header in headers})
+    return path
+
+
+def _timeline_sort_key(row: Dict[str, Any]) -> Tuple[str, str]:
+    return (
+        str(row.get("save_datetime", "")),
+        str(row.get("source_file", "")),
+    )
+
+
+def _play_time_hours(metadata: Dict[str, Any]) -> str:
+    play_seconds = metadata.get("play_duration_seconds")
+    if isinstance(play_seconds, int):
+        return f"{play_seconds / 3600:.2f}"
+    return ""
+
+
+def _normalize_scalar(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, float):
+        return round(value, 3)
+    return value
+
+
+def _safe_key(value: Any) -> str:
+    text = str(value).strip()
+    output: List[str] = []
+    last_was_underscore = False
+    for char in text:
+        if char.isalnum():
+            output.append(char.casefold())
+            last_was_underscore = False
+            continue
+        if not last_was_underscore:
+            output.append("_")
+            last_was_underscore = True
+    return "".join(output).strip("_") or "value"
+
+
+def _save_ticks_to_datetime(save_ticks: Any) -> datetime | None:
+    if not isinstance(save_ticks, int) or save_ticks <= 0:
+        return None
+    return DOTNET_EPOCH + timedelta(microseconds=save_ticks // 10)
+
+
+def _format_datetime(value: datetime | None) -> str:
+    if value is None:
+        return ""
+    return value.isoformat()

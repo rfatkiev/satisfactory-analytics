@@ -3,7 +3,15 @@
 import argparse
 from pathlib import Path
 
-from .parse import parse_save, write_json, write_csv, write_csv_bundle
+from .parse import (
+    parse_save,
+    parse_saves_in_directory,
+    write_csv,
+    write_csv_bundle,
+    write_json,
+    write_timeline_csv,
+    write_timeline_csv_bundle,
+)
 from .postgres import load_postgres_bundle, write_postgres_bundle
 
 
@@ -14,6 +22,10 @@ def build_parser() -> argparse.ArgumentParser:
     parse_cmd = sub.add_parser("parse", help="Parse a Satisfactory .sav file")
     parse_cmd.add_argument("--input", required=True, help="Path to .sav file")
     parse_cmd.add_argument("--output", required=True, help="Path to output JSON/CSV or output directory for CSV bundle")
+
+    scan_cmd = sub.add_parser("scan-folder", help="Parse all .sav files in a directory and export one timeline CSV")
+    scan_cmd.add_argument("--input-dir", required=True, help="Directory with .sav files")
+    scan_cmd.add_argument("--output", required=True, help="Path to aggregated CSV file")
 
     export_db_cmd = sub.add_parser("export-db", help="Export normalized PostgreSQL CSV tables from a .sav file")
     export_db_cmd.add_argument("--input", required=True, help="Path to .sav file")
@@ -46,6 +58,16 @@ def main(argv: list[str] | None = None) -> int:
             write_json(result, output_path)
         else:
             write_csv(result, output_path)
+        return 0
+
+    if args.command == "scan-folder":
+        input_dir = Path(args.input_dir)
+        output_path = Path(args.output)
+        results = parse_saves_in_directory(input_dir)
+        if output_path.suffix.lower() == ".csv":
+            write_timeline_csv(results, output_path)
+        else:
+            write_timeline_csv_bundle(results, output_path)
         return 0
 
     if args.command == "export-db":
